@@ -1,0 +1,45 @@
+apiVersion: apps.paia.tech/v1alpha1
+kind: HotStandbyJob
+metadata:
+  name: game-worker
+  namespace: default
+spec:
+  idleTarget: 3
+  minReplicas: 0
+  maxReplicas: 20
+  scaleDownDelaySeconds: 30
+
+  # Pods to count as capacity:
+  selector:
+    matchLabels:
+      app: game-worker
+
+  # What to run for each unit of capacity:
+  jobTemplate:
+    parallelism: 1
+    backoffLimit: 0
+    ttlSecondsAfterFinished: 60
+    template:
+      metadata:
+        labels:
+          app: game-worker
+      spec:
+        restartPolicy: Never
+        containers:
+          - name: worker
+            image: busybox:1.36
+            command: ["/bin/sh","-c"]
+            args:
+              - |
+                # echo idle > /tmp/busy_state;
+                # flip to busy when you start handling work:
+                # echo busy > /tmp/busy_state
+                # simulate some work:
+                sleep 600
+
+  busyProbe:
+    mode: exec
+    exec:
+      command: ["cat", "/tmp/busy_state"] 
+      timeoutSeconds: 1
+      successIsBusy: true

@@ -1,0 +1,28 @@
+# deploy-operator.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hotstandbyjob-operator
+  namespace: paia-operators
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hotstandbyjob-operator
+  template:
+    metadata:
+      labels:
+        app: hotstandbyjob-operator
+    spec:
+      serviceAccountName: hotstandbyjob-operator
+      containers:
+        - name: operator
+          image: patrickuuuu/hotstandbyjob-operator:develop
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
