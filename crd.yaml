@@ -1,4 +1,3 @@
-# crd-hsj.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -15,51 +14,88 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
-      subresources: { status: {} }
+      subresources:
+        status: {}
       additionalPrinterColumns:
-        - name: IdleTarget
-          type: integer
-          jsonPath: .spec.idleTarget
-        - name: Busy
-          type: integer
-          jsonPath: .status.busyCount
-        - name: Total
-          type: integer
-          jsonPath: .status.desiredReplicas
         - name: Mode
           type: string
           jsonPath: .spec.busyProbe.mode
+        - name: IdleTarget
+          type: integer
+          jsonPath: .spec.idleTarget
+        - name: Min
+          type: integer
+          jsonPath: .spec.minReplicas
+        - name: Max
+          type: integer
+          jsonPath: .spec.maxReplicas
+        - name: Busy
+          type: integer
+          jsonPath: .status.busyCount
+        - name: Idle
+          type: integer
+          jsonPath: .status.idleCount
+        - name: ActivePods
+          type: integer
+          jsonPath: .status.activeCount
+        - name: DesiredActive
+          type: integer
+          jsonPath: .status.desiredActive
+        - name: ChildJobs
+          type: integer
+          jsonPath: .status.childJobs
+        - name: ActiveJobs
+          type: integer
+          jsonPath: .status.activeJobs
+        - name: CompletedJobs
+          type: integer
+          jsonPath: .status.completedJobs
+        - name: FailedJobs
+          type: integer
+          jsonPath: .status.failedJobs
+        - name: LastSync
+          type: date
+          jsonPath: .status.lastSyncTime
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
       schema:
         openAPIV3Schema:
           type: object
+          required: [spec]
           properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
             spec:
               type: object
-              required: ["idleTarget","jobTemplate","selector"]
+              description: HotStandbyJob spec controls standby 策略與 Job 模板
               properties:
+                selector:
+                  type: object
+                  properties:
+                    matchLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
                 idleTarget:
                   type: integer
                   minimum: 0
                 minReplicas:
                   type: integer
                   minimum: 0
-                  default: 0
+                  nullable: true
                 maxReplicas:
                   type: integer
-                  minimum: 1
-                  default: 1000
-                selector:
-                  type: object
-                  properties:
-                    matchLabels:
-                      type: object
-                      additionalProperties: { type: string }
-                jobTemplate:
-                  type: object
-                  x-kubernetes-preserve-unknown-fields: true
+                  minimum: 0
+                  nullable: true
+                scaleDownDelaySeconds:
+                  type: integer
+                  minimum: 0
+                  description: 縮容前的延遲秒數（可由 operator 採用）
                 busyProbe:
                   type: object
                   properties:
@@ -74,30 +110,48 @@ spec:
                       type: object
                       properties:
                         port: { type: integer, default: 8080 }
-                        path: { type: string, default: /busy }
-                        successIsBusy: { type: boolean, default: true }
+                        path: { type: string,  default: "/busy" }
                         timeoutSeconds: { type: integer, minimum: 0, default: 1 }
-                        periodSeconds: { type: integer, minimum: 1, default: 10 }
+                        periodSeconds: { type: integer, minimum: 0, default: 10 }
+                        successIsBusy: { type: boolean, default: true }
                     exec:
                       type: object
                       properties:
                         command:
                           type: array
                           items: { type: string }
-                          minItems: 1
-                        container:
-                          type: string
-                        successIsBusy:
-                          type: boolean
-                          default: true
-                        timeoutSeconds:
-                          type: integer
-                          minimum: 0
-                          default: 1
+                          default: ["cat","/tmp/healthy"]
+                        container: { type: string, nullable: true }
+                        timeoutSeconds: { type: integer, minimum: 0, default: 1 }
+                        successIsBusy: { type: boolean, default: true }
+                jobTemplate:
+                  type: object
+                  description: Inline batch/v1 JobSpec（直接放 template/backoffLimit/...）
+                  x-kubernetes-preserve-unknown-fields: true
             status:
               type: object
+              description: 由 operator 回寫的觀測與統計
               properties:
                 observedGeneration: { type: integer }
                 busyCount: { type: integer }
                 idleCount: { type: integer }
-                desiredReplicas: { type: integer }
+                activeCount: { type: integer }
+                desiredActive: { type: integer }
+                childJobs: { type: integer }
+                activeJobs: { type: integer }
+                completedJobs: { type: integer }
+                failedJobs: { type: integer }
+                lastSyncTime:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: ["type","status"]
+                    properties:
+                      type: { type: string }
+                      status: { type: string, enum: ["True","False","Unknown"] }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }

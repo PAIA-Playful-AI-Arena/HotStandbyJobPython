@@ -1,10 +1,10 @@
-# operate_hsj_parallelism.py
 import os
 import typing as t
 import time
 import kopf
 import requests
 from copy import deepcopy
+from datetime import datetime, timezone
 
 from kubernetes import client
 from kubernetes.config import load_kube_config, load_incluster_config
@@ -64,7 +64,11 @@ def _merge_labels(*dicts: t.Dict[str, str]) -> t.Dict[str, str]:
 def _pods_by_selector(v1: CoreV1Api, namespace: str, match_labels: dict) -> list[client.V1Pod]:
     sel = ",".join([f"{k}={v}" for k, v in (match_labels or {}).items()])
     pods = v1.list_namespaced_pod(namespace, label_selector=sel).items
-    return [p for p in pods if not p.metadata.deletion_timestamp]
+    # <<< 只保留「未標記刪除、且 phase=Running」的 Pod，避免 Completed/Failed 影響忙碌/Idle 計數
+    return [
+        p for p in pods
+        if not p.metadata.deletion_timestamp and p.status and p.status.phase == "Running"
+    ]
 
 
 def _is_pod_busy_by_annotation(pod: client.V1Pod, ann_key: str) -> bool:
@@ -126,7 +130,7 @@ def _count_busy_idle(
     ann_key: str,
     http_cfg: dict,
     exec_cfg: dict,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     pods = _pods_by_selector(v1, namespace, match_labels)
     busy = 0
     if mode == "http":
@@ -137,12 +141,16 @@ def _count_busy_idle(
         for p in pods:
             if _is_pod_busy_by_exec(v1, p, namespace, exec_cfg):
                 busy += 1
-    else:
+    elif mode == "annotation":
         for p in pods:
             if _is_pod_busy_by_annotation(p, ann_key):
                 busy += 1
-    idle = max(0, len(pods) - busy)
-    return busy, idle
+    else:
+        raise ValueError(f"invalid probe mode: {mode}")
+
+    total_active = len(pods)
+    idle = max(0, total_active - busy)
+    return busy, idle, total_active
 
 
 def _get_probe_conf(spec: dict) -> tuple[str, str, dict, dict]:
@@ -154,21 +162,16 @@ def _get_probe_conf(spec: dict) -> tuple[str, str, dict, dict]:
     return mode, ann_key, http_cfg, exec_cfg
 
 
-def _desired_replicas(busy: int, idle_target: int, min_r: t.Optional[int], max_r: t.Optional[int]) -> int:
+def _desired_active_replicas(busy: int, idle_target: int, min_r: t.Optional[int], max_r: t.Optional[int]) -> int:
     desired = int(busy) + int(idle_target)
     if min_r is not None:
         desired = max(desired, int(min_r))
     if max_r is not None:
         desired = min(desired, int(max_r))
-    return desired
+    return max(0, desired)
 
 
-def _ensure_child_job(batch: BatchV1Api, owner_body: dict, name: str, namespace: str, job_spec: dict) -> client.V1Job:
-    """
-    確保存在一個 Job：<name>-workload。
-    若不存在則使用 CR.spec.jobTemplate 建立；存在則直接回傳。
-    之後僅 patch .spec.parallelism。
-    """
+def _ensure_child_job(batch: BatchV1Api, owner_body: dict, name: str, namespace: str, job_spec: dict, selector: dict) -> client.V1Job:
     job_name = f"{name}-workload"
     try:
         return batch.read_namespaced_job(name=job_name, namespace=namespace)
@@ -176,7 +179,16 @@ def _ensure_child_job(batch: BatchV1Api, owner_body: dict, name: str, namespace:
         if e.status != 404:
             raise
 
-    # create new
+    spec_copy = deepcopy(job_spec)
+
+    tmpl = spec_copy.setdefault("template", {}).setdefault("metadata", {})
+    tmpl_labels = tmpl.setdefault("labels", {})
+    tmpl["labels"] = _merge_labels(tmpl_labels, selector, {JOB_OWNER_LABEL: owner_body["metadata"]["name"]})
+
+    pod_spec = spec_copy["template"].setdefault("spec", {})
+    if pod_spec.get("restartPolicy") not in (None, "Never"):
+        pod_spec["restartPolicy"] = "Never"
+
     body = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -195,32 +207,100 @@ def _ensure_child_job(batch: BatchV1Api, owner_body: dict, name: str, namespace:
                 "blockOwnerDeletion": True,
             }],
         },
-        "spec": deepcopy(job_spec),
+        "spec": spec_copy,
     }
     return batch.create_namespaced_job(namespace=namespace, body=body)
 
 
-def _patch_job_parallelism(batch: BatchV1Api, namespace: str, name: str, parallelism: int) -> client.V1Job:
+def _patch_job(batch: BatchV1Api, namespace: str, name: str, parallelism: int, completions: int) -> client.V1Job:
     job_name = f"{name}-workload"
-    patch = {"spec": {"parallelism": int(parallelism)}}
+    patch = {"spec": {"parallelism": int(parallelism), "completions": int(completions)}}  # <<<
     batch.patch_namespaced_job(name=job_name, namespace=namespace, body=patch)
     return batch.read_namespaced_job(name=job_name, namespace=namespace)
 
 
-# ---------- core reconcile ----------
-def _sync_once(
-    memo: kopf.Memo,
-    body: dict,
-    spec: dict,
-    status: dict,
-    meta: dict,
-) -> dict:
+def _list_child_jobs(batch: BatchV1Api, namespace: str, owner_name: str) -> list[client.V1Job]:
+    sel = f"{JOB_OWNER_LABEL}={owner_name}"
+    return batch.list_namespaced_job(namespace, label_selector=sel).items
+
+def _job_is_active(j: client.V1Job) -> bool:
+    s = j.status or client.V1JobStatus()
+    return bool(s.active)
+
+def _job_is_completed(j: client.V1Job) -> bool:
+    s = j.status or client.V1JobStatus()
+    return (s.succeeded or 0) > 0 and not s.active
+
+def _job_is_failed(j: client.V1Job) -> bool:
+    s = j.status or client.V1JobStatus()
+    return (s.failed or 0) > 0 and not s.active
+
+def _create_one_child_job(batch: BatchV1Api, owner_body: dict, name: str, namespace: str, job_spec: dict, selector: dict) -> client.V1Job:
+    import random, string
+    suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+    job_name = f"{name}-w-{suffix}"
+
+    spec_copy = deepcopy(job_spec)
+
+    tmpl = spec_copy.setdefault("template", {}).setdefault("metadata", {})
+    tmpl_labels = tmpl.setdefault("labels", {})
+    tmpl["labels"] = _merge_labels(tmpl_labels, selector, {JOB_OWNER_LABEL: owner_body["metadata"]["name"]})
+
+    pod_spec = spec_copy["template"].setdefault("spec", {})
+    pod_spec["restartPolicy"] = "Never"
+
+    spec_copy["completions"] = 1
+    spec_copy["parallelism"] = 1
+
+    body = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": job_name,
+            "namespace": namespace,
+            "labels": {JOB_OWNER_LABEL: owner_body["metadata"]["name"]},
+            "ownerReferences": [{
+                "apiVersion": owner_body["apiVersion"],
+                "kind": owner_body["kind"],
+                "name": owner_body["metadata"]["name"],
+                "uid": owner_body["metadata"]["uid"],
+                "controller": True,
+                "blockOwnerDeletion": True,
+            }],
+        },
+        "spec": spec_copy,
+    }
+    return batch.create_namespaced_job(namespace=namespace, body=body)
+
+def _scale_job_pool(batch: BatchV1Api, namespace: str, owner_body: dict, owner_name: str,
+                    desired_active: int, job_template: dict, selector: dict):
+    jobs = _list_child_jobs(batch, namespace, owner_name)
+    active_jobs = [j for j in jobs if _job_is_active(j)]
+    completed_jobs = [j for j in jobs if _job_is_completed(j)]
+    cur_active = len(active_jobs)
+
+    if cur_active < desired_active:
+        need = desired_active - cur_active
+        for _ in range(need):
+            _create_one_child_job(batch, owner_body, owner_name, namespace, job_template, selector)
+
+    elif cur_active > desired_active:
+        too_many = cur_active - desired_active
+        to_delete = active_jobs[-too_many:]
+        for j in to_delete:
+            batch.delete_namespaced_job(
+                name=j.metadata.name,
+                namespace=namespace,
+                body=client.V1DeleteOptions(propagation_policy="Background")
+            )
+
+
+def _sync_once(memo: kopf.Memo, body: dict, spec: dict, status: dict, meta: dict) -> dict:
     namespace = meta["namespace"]
     name = meta["name"]
 
     idle_target = int(spec.get("idleTarget", 0))
-    min_r = spec.get("minReplicas")
-    max_r = spec.get("maxReplicas")
+    min_r = spec.get("minReplicas"); max_r = spec.get("maxReplicas")
     min_r = int(min_r) if min_r is not None else None
     max_r = int(max_r) if max_r is not None else None
 
@@ -229,36 +309,44 @@ def _sync_once(
 
     mode, ann_key, http_cfg, exec_cfg = _get_probe_conf(spec)
 
-    # 1) 確保子 Job 存在
-    job = _ensure_child_job(memo.batch, body, name, namespace, job_template)
-
-    # 2) 計算 busy/idle
-    busy, idle = _count_busy_idle(
-        v1=memo.v1,
-        namespace=namespace,
-        match_labels=selector,
-        mode=mode,
-        ann_key=ann_key,
-        http_cfg=http_cfg,
-        exec_cfg=exec_cfg,
+    busy, idle, total_active = _count_busy_idle(
+        v1=memo.v1, namespace=namespace, match_labels=selector,
+        mode=mode, ann_key=ann_key, http_cfg=http_cfg, exec_cfg=exec_cfg,
     )
-
-    # 3) 期望並調整 parallelism
-    desired = _desired_replicas(busy, idle_target, min_r, max_r)
-
-    current_parallelism = int(job.spec.parallelism or 0)
-    if current_parallelism != desired:
-        job = _patch_job_parallelism(memo.batch, namespace, name, desired)
-
+    desired_active = _desired_active_replicas(busy, idle_target, min_r, max_r)
+    _scale_job_pool(
+        batch=memo.batch,
+        namespace=namespace,
+        owner_body=body,
+        owner_name=name,
+        desired_active=desired_active,
+        job_template=job_template,
+        selector=selector,
+    )
+    jobs = _list_child_jobs(memo.batch, namespace, name)
+    active_jobs = [j for j in jobs if _job_is_active(j)]
+    completed_jobs = [j for j in jobs if _job_is_completed(j)]
+    failed_jobs = [j for j in jobs if _job_is_failed(j)]
     return {
         "busyCount": int(busy),
         "idleCount": int(idle),
-        "desiredReplicas": int(desired),
+        "activeCount": int(total_active),  # 只計 Running Pods
+        "desiredActive": int(desired_active),
+        "childJobs": len(jobs),
+        "activeJobs": len(active_jobs),
+        "completedJobs": len(completed_jobs),
+        "failedJobs": len(failed_jobs),
+        "lastSyncTime": datetime.now(timezone.utc).isoformat(),
         "observedGeneration": int(meta.get("generation", 0)),
+        # 如果你也想要 conditions，可直接放在這裡（會覆蓋整個陣列）
+        # "conditions": [{
+        #   "type": "Ready", "status": "True",
+        #   "reason": "Reconciled",
+        #   "message": "Reconcile OK",
+        #   "lastTransitionTime": datetime.now(timezone.utc).isoformat(),
+        # }],
     }
 
-
-# ---------- handlers ----------
 @kopf.on.create(GROUP, VERSION, PLURAL)
 @kopf.on.update(GROUP, VERSION, PLURAL)
 @kopf.on.resume(GROUP, VERSION, PLURAL)
