@@ -1,4 +1,4 @@
-apiVersion: apps.paia.areana/v1alpha1
+apiVersion: apps.paia.tech/v1alpha1
 kind: HotStandbyJob
 metadata:
   name: game-worker3
@@ -26,20 +26,20 @@ spec:
       spec:
         restartPolicy: Never
         containers:
-          - name: worker
-            image: busybox:1.36
-            command: ["/bin/sh","-c"]
-            args:
-              - |
-                # echo idle > /tmp/busy_state;
-                # flip to busy when you start handling work:
-                # echo busy > /tmp/busy_state
-                # simulate some work:
-                sleep 30
+        - name: worker
+          image: busybox:1.36
+          command: [ "/bin/sh", "-c" ]
+          args:
+          - |
+            # echo idle > /tmp/busy_state;
+            # flip to busy when you start handling work:
+            # echo busy > /tmp/busy_state
+            # simulate some work:
+            sleep 30
 
   busyProbe:
     mode: exec
     exec:
-      command: ["cat", "/tmp/busy_state"] 
+      command: [ "cat", "/tmp/busy_state" ]
       timeoutSeconds: 1
       successIsBusy: true

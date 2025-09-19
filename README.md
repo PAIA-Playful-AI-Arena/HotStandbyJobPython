@@ -85,13 +85,14 @@ kopf run -A operate_hsj_parallelism.py
 `HotStandbyJob`（namespaced）常見欄位示意：
 
 ```yaml
-apiVersion: your.group/v1alpha1
+apiVersion: apps.paia.tech/v1alpha1
 kind: HotStandbyJob
 metadata:
   name: demo-hsj
 spec:
-  standbyReplicas: 2            # 想維持的熱身（standby）Pod 數量
-  scaleDownDelaySeconds: 60     # 間隔多長時間才回收多餘 Standby，避免反覆震盪
+  idleTarget: 20 # 預備的 Pod 數量
+  minReplicas: 0
+  maxReplicas: 100
 
   # 你的工作負載模板（通常類似 Job 的模板）
   jobTemplate:
@@ -101,17 +102,14 @@ spec:
     backoffLimit: 0
     ttlSecondsAfterFinished: 60
 
-  triggers:
-    type: "annotation|http|queue"
+  busyProbe:
+    mode: exec
+    exec:
+      command: [ "cat", "/tmp/busy_state" ]
+      timeoutSeconds: 1
+      successIsBusy: true
+
 ```
-
----
-
-## 🔄 Parallelism 變體
-
-- `operate_hsj_parallelism.py` 針對需要 **一次啟多個工作** 的場景設計。
-- 使用方式同主程式，但請先確認 `crd.yaml`／`example.yaml` 是否支援 `parallelism`。
-
 ---
 
 ## 🛠️ 開發與建置
@@ -125,7 +123,7 @@ kubectl apply -f deploy-operate.yaml
 
 ### 本機測試
 ```bash
-python operate_hsj.py
+kopf run -A operate_hsj_parallelism.py
 kubectl get pods,job,hotstandbyjob -w
 ```
 
@@ -146,6 +144,6 @@ kubectl describe hotstandbyjob <name>
 ```bash
 kubectl delete -f example.yaml
 kubectl delete -f deploy-operate.yaml
-kubectl delete -f rbac.yaml
+kubectl delete -f sa-rbac.yaml
 kubectl delete -f crd.yaml
 ```
