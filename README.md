@@ -65,10 +65,13 @@ kubectl describe hotstandbyjob <name>
 ```
 
 ### （選擇）本機執行 Operator
+
+> 需要先安裝 CRD 不過不需要 RBAC 或 SA
+
 若要在本機直連叢集測試：
 ```bash
 pip install -r requirements.txt
-python operate_hsj.py
+kopf run -A operate_hsj_parallelism.py
 # 或針對平行版：
 # python operate_hsj_parallelism.py
 ```
