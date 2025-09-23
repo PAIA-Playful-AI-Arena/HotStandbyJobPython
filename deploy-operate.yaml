@@ -15,10 +15,15 @@ spec:
         app: hotstandbyjob-operator
     spec:
       serviceAccountName: hotstandbyjob-operator
+      imagePullSecrets:
+        - name: acr-paiaimages
       containers:
         - name: operator
-          image: patrickuuuu/hotstandbyjob-operator:develop
+          image: paiaimages.azurecr.io/hot-standby-job-operator:0.2.1
           imagePullPolicy: IfNotPresent
+          env:
+            - name: SYNC_INTERVAL
+              value: "5.0"
           resources:
             requests:
               cpu: "100m"

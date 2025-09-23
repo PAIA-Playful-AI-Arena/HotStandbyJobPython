@@ -5,7 +5,7 @@ import kopf
 import requests
 from copy import deepcopy
 from datetime import datetime, timezone
-
+from loguru import logger
 from kubernetes import client
 from kubernetes.config import load_kube_config, load_incluster_config
 from kubernetes.client import CoreV1Api, BatchV1Api
@@ -270,6 +270,7 @@ def _create_one_child_job(batch: BatchV1Api, owner_body: dict, name: str, namesp
         },
         "spec": spec_copy,
     }
+    logger.info(body)
     return batch.create_namespaced_job(namespace=namespace, body=body)
 
 def _scale_job_pool(batch: BatchV1Api, namespace: str, owner_body: dict, owner_name: str,
@@ -354,7 +355,8 @@ def reconcile(spec, status, meta, body, memo: kopf.Memo, **_):
     return _sync_once(memo, body, spec, status or {}, meta)
 
 
-@kopf.timer(GROUP, VERSION, PLURAL, interval=10.0)
+SYNC_INTERVAL = float(os.getenv("SYNC_INTERVAL", "10.0"))
+@kopf.timer(GROUP, VERSION, PLURAL, interval=SYNC_INTERVAL)
 def periodic(spec, status, meta, body, memo: kopf.Memo, **_):
     try:
         return _sync_once(memo, body, spec, status or {}, meta)
