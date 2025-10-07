@@ -1,4 +1,7 @@
-kopf
-kubernetes
-requests
-loguru
+kopf>=1.38.0
+kubernetes>=33.0.0
+requests>=2.32.0
+loguru>=0.7.0
+websocket-client>=1.8.0,<2.0.0
+redis>=5.0.0
+python-dotenv>=1.0.0

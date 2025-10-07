@@ -1,6 +1,5 @@
 import os
 import typing as t
-import time
 import kopf
 import requests
 from copy import deepcopy
@@ -12,6 +11,20 @@ from kubernetes.client import CoreV1Api, BatchV1Api
 from kubernetes.client.exceptions import ApiException
 from kubernetes.config.config_exception import ConfigException
 from kubernetes.stream import stream as k8s_stream
+from dotenv import load_dotenv
+
+load_dotenv(".env")
+
+# 導入 PodStatusMonitor（可選）
+try:
+    from pod_status_manager import PodStatusMonitor, RedisConnectionManager, PodStatus
+    REDIS_AVAILABLE = True
+except ImportError:
+    logger.warning("⚠️ PodStatusMonitor not available, Redis mode disabled")
+    REDIS_AVAILABLE = False
+    PodStatusMonitor = None
+    RedisConnectionManager = None
+    PodStatus = None
 
 GROUP = "apps.paia.tech"
 VERSION = "v1alpha1"
@@ -50,6 +63,36 @@ def init_clients(memo: kopf.Memo, **_):
 
     memo.v1: CoreV1Api = client.CoreV1Api()
     memo.batch: BatchV1Api = client.BatchV1Api()
+    
+    # 初始化 PodStatusMonitor（如果有配置 Redis）
+    if REDIS_AVAILABLE:
+        redis_host = os.getenv("REDIS_HOST", "localhost")
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        redis_db = int(os.getenv("REDIS_DB", "0"))
+        redis_password = os.getenv("REDIS_PASSWORD")
+        redis_key_prefix = os.getenv("REDIS_KEY_PREFIX", "mlgame-daemon-pod")
+        
+        try:
+            # 建立 Redis 客戶端
+            redis_client = RedisConnectionManager.create_client(
+                redis_host=redis_host,
+                redis_port=redis_port,
+                redis_db=redis_db,
+                redis_password=redis_password,
+                decode_responses=True
+            )
+            
+            # 建立 PodStatusMonitor
+            memo.pod_status_monitor = PodStatusMonitor(
+                redis_client=redis_client,
+                key_prefix=redis_key_prefix
+            )
+            logger.info(f"✅ PodStatusMonitor initialized (Redis: {redis_host}:{redis_port}/{redis_db}, prefix: {redis_key_prefix})")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to initialize PodStatusMonitor: {e}. Redis mode disabled.")
+            memo.pod_status_monitor = None
+    else:
+        memo.pod_status_monitor = None
 
 
 # ---------- helpers ----------
@@ -100,7 +143,7 @@ def _is_pod_busy_by_exec(v1: CoreV1Api, pod: client.V1Pod, namespace: str, exec_
     cmd = exec_cfg.get("command", EXEC_DEFAULTS["command"]) or EXEC_DEFAULTS["command"]
     container = exec_cfg.get("container", EXEC_DEFAULTS["container"])
     timeout = int(exec_cfg.get("timeoutSeconds", EXEC_DEFAULTS["timeoutSeconds"]))
-    success_is_busy = bool(exec_cfg.get("successIsBusy", EXEC_DEFAULTS["successIsBusy"]))
+    # success_is_busy = bool(exec_cfg.get("successIsBusy", EXEC_DEFAULTS["successIsBusy"]))
     try:
         resp = k8s_stream(
             v1.connect_get_namespaced_pod_exec,
@@ -117,9 +160,15 @@ def _is_pod_busy_by_exec(v1: CoreV1Api, pod: client.V1Pod, namespace: str, exec_
         resp.run_forever(timeout=timeout)
         ok = (resp.returncode == 0)
         resp.close()
+        
+        if not ok :
+            # check the pod is successed or not
+            pod = v1.read_namespaced_pod(pod.metadata.name, namespace)
+            if pod.status.phase == "Succeeded":
+                ok = True
     except Exception:
         ok = False
-    return bool(ok) if success_is_busy else (not ok)
+    return bool(ok) 
 
 
 def _count_busy_idle(
@@ -130,27 +179,140 @@ def _count_busy_idle(
     ann_key: str,
     http_cfg: dict,
     exec_cfg: dict,
+    pod_status_monitor: t.Optional[PodStatusMonitor] = None,
 ) -> tuple[int, int, int]:
+    """
+    計算 busy 和 idle 的 Pod 數量
+    
+    支援多種模式：
+    - redis: 從 Redis 查詢狀態（最高效，推薦）
+    - http: HTTP 探測
+    - exec: exec 命令探測
+    - annotation: 透過 annotation 判斷
+    """
+    
+    # 優先使用 Redis 模式（如果有配置且 mode 為 redis）
+    if mode == "redis" and pod_status_monitor:
+        return _count_busy_idle_redis(v1, namespace, match_labels, pod_status_monitor)
+    
+    # Fallback 到原有的探測方式
     pods = _pods_by_selector(v1, namespace, match_labels)
-    busy = 0
+    busy_count = 0
+    successed_pods = 0
+    running_pods_count = 0
+    failed_pods = 0
+    running_pods = []
+    
+    for p in pods:
+        if p.status.phase == "Succeeded":
+            successed_pods += 1
+        elif p.status.phase == "Running":
+            running_pods_count += 1
+            running_pods.append(p)
+        elif p.status.phase == "Failed":
+            failed_pods += 1
+    
     if mode == "http":
-        for p in pods:
+        for p in running_pods:
             if _is_pod_busy_by_http(p, http_cfg):
-                busy += 1
+                busy_count += 1
     elif mode == "exec":
-        for p in pods:
+        for p in running_pods:
             if _is_pod_busy_by_exec(v1, p, namespace, exec_cfg):
-                busy += 1
+                busy_count += 1
     elif mode == "annotation":
-        for p in pods:
+        for p in running_pods:
             if _is_pod_busy_by_annotation(p, ann_key):
-                busy += 1
+                busy_count += 1
+    elif mode == "redis":
+        # Redis 模式但沒有 pod_status_monitor，記錄警告並 fallback 到 annotation
+        logger.warning("Redis mode requested but PodStatusMonitor not available, falling back to annotation mode")
+        for p in running_pods:
+            if _is_pod_busy_by_annotation(p, ann_key):
+                busy_count += 1
     else:
         raise ValueError(f"invalid probe mode: {mode}")
 
-    total_active = len(pods)
-    idle = max(0, total_active - busy)
-    return busy, idle, total_active
+    # total_active = len(running_pods)
+    idle = max(0, running_pods_count - busy_count)
+    if bool(exec_cfg.get("successIsBusy", EXEC_DEFAULTS["successIsBusy"])):
+        busy_count += successed_pods
+    return busy_count, idle, running_pods_count
+
+
+def _count_busy_idle_redis(
+    v1: CoreV1Api,
+    namespace: str,
+    match_labels: dict,
+    pod_status_monitor: PodStatusMonitor,
+) -> tuple[int, int, int]:
+    """
+    使用 Redis 來計算 busy/idle 數量（高效能版本）
+    
+    優點：
+    1. 避免頻繁呼叫 K8s API
+    2. 批次查詢，只需 1 次 Redis 往返（HGETALL）
+    3. 避免 WebSocket 連線問題
+    """
+    # 先從 K8s 取得 Pod 列表（只取名稱）
+    pods = _pods_by_selector(v1, namespace, match_labels)
+    pod_names = [p.metadata.name for p in pods]
+    
+    if not pod_names:
+        return 0, 0, 0
+    
+    # 批次從 Redis 查詢所有 Pod 的狀態（一次 HGETALL 完成！）
+    try:
+        # 使用新的 API：get_all_pods() 回傳 {pod_name: {"status": "idle", "updated_at": 1234567890}}
+        all_statuses = pod_status_monitor.get_all_pods()
+        logger.debug(f"[{namespace}] Retrieved {len(all_statuses)} pod statuses from Redis")
+    except Exception as e:
+        logger.error(f"❌ Failed to get pod statuses from Redis: {e}")
+        # Fallback: 從 K8s API 計算（假設全部為 busy，需要擴容）
+        return len(pods), 0, len(pods)
+    
+    # 統計各種狀態
+    busy_count = 0
+    idle_count = 0
+    starting_count = 0
+    error_count = 0
+    unknown_count = 0
+    
+    for pod_name in pod_names:
+        status_dict = all_statuses.get(pod_name)
+        
+        if not status_dict:
+            # Redis 中沒有該 Pod 的狀態，視為 unknown（可能是新啟動或尚未註冊）
+            unknown_count += 1
+            logger.debug(f"Pod {pod_name} not found in Redis, treating as starting")
+            starting_count += 1
+            continue
+        
+        pod_status = status_dict.get("status", PodStatus.IDLE)
+        
+        if pod_status == PodStatus.BUSY:
+            busy_count += 1
+        elif pod_status == PodStatus.IDLE:
+            idle_count += 1
+        elif pod_status == PodStatus.STARTING:
+            starting_count += 1
+        elif pod_status == PodStatus.ERROR:
+            error_count += 1
+        else:
+            # 未知狀態當作 idle
+            unknown_count += 1
+            idle_count += 1
+    
+    total_active = len(pod_names)
+    
+    logger.debug(
+        f"[{namespace}] Redis status summary: total={total_active}, busy={busy_count}, "
+        f"idle={idle_count}, starting={starting_count}, error={error_count}, unknown={unknown_count}"
+    )
+    
+    # 回傳：busy_count, idle_count, total_active
+    # 注意：starting/error 的 Pod 不計入 idle，也不計入 busy
+    return busy_count, idle_count, total_active
 
 
 def _get_probe_conf(spec: dict) -> tuple[str, str, dict, dict]:
@@ -270,7 +432,7 @@ def _create_one_child_job(batch: BatchV1Api, owner_body: dict, name: str, namesp
         },
         "spec": spec_copy,
     }
-    logger.info(body)
+    # logger.info(body)
     return batch.create_namespaced_job(namespace=namespace, body=body)
 
 def _scale_job_pool(batch: BatchV1Api, namespace: str, owner_body: dict, owner_name: str,
@@ -284,16 +446,17 @@ def _scale_job_pool(batch: BatchV1Api, namespace: str, owner_body: dict, owner_n
         need = desired_active - cur_active
         for _ in range(need):
             _create_one_child_job(batch, owner_body, owner_name, namespace, job_template, selector)
-
-    elif cur_active > desired_active:
-        too_many = cur_active - desired_active
-        to_delete = active_jobs[-too_many:]
-        for j in to_delete:
-            batch.delete_namespaced_job(
-                name=j.metadata.name,
-                namespace=namespace,
-                body=client.V1DeleteOptions(propagation_policy="Background")
-            )
+    # TODO 如果採用redis 來判斷忙碌/閒置，這裡可以刪除 idle 的 Job
+    # elif cur_active > desired_active:
+    #     # 這裡好像有可能刪除到正在運行遊戲的 Job
+    #     too_many = cur_active - desired_active
+    #     to_delete = active_jobs[-too_many:]
+    #     for j in to_delete:
+    #         batch.delete_namespaced_job(
+    #             name=j.metadata.name,
+    #             namespace=namespace,
+    #             body=client.V1DeleteOptions(propagation_policy="Background")
+    #         )
 
 
 def _sync_once(memo: kopf.Memo, body: dict, spec: dict, status: dict, meta: dict) -> dict:
@@ -311,8 +474,14 @@ def _sync_once(memo: kopf.Memo, body: dict, spec: dict, status: dict, meta: dict
     mode, ann_key, http_cfg, exec_cfg = _get_probe_conf(spec)
 
     busy, idle, total_active = _count_busy_idle(
-        v1=memo.v1, namespace=namespace, match_labels=selector,
-        mode=mode, ann_key=ann_key, http_cfg=http_cfg, exec_cfg=exec_cfg,
+        v1=memo.v1, 
+        namespace=namespace, 
+        match_labels=selector,
+        mode=mode, 
+        ann_key=ann_key, 
+        http_cfg=http_cfg, 
+        exec_cfg=exec_cfg,
+        pod_status_monitor=getattr(memo, 'pod_status_monitor', None),
     )
     desired_active = _desired_active_replicas(busy, idle_target, min_r, max_r)
     _scale_job_pool(
@@ -359,7 +528,11 @@ SYNC_INTERVAL = float(os.getenv("SYNC_INTERVAL", "10.0"))
 @kopf.timer(GROUP, VERSION, PLURAL, interval=SYNC_INTERVAL)
 def periodic(spec, status, meta, body, memo: kopf.Memo, **_):
     try:
-        return _sync_once(memo, body, spec, status or {}, meta)
+        logger.info(f"[{meta['namespace']}/{meta['name']}] Periodic reconcile started")
+        result = _sync_once(memo, body, spec, status or {}, meta)
+        # logger.info(f"[{meta['namespace']}/{meta['name']}] Periodic reconcile completed: {result}")
+        return result
     except Exception as e:
+        logger.error(f"[{meta['namespace']}/{meta['name']}] Periodic reconcile failed: {e}")
         kopf.info(body, reason="ReconcileError", message=f"timer reconcile failed: {e}")
-        return None
+        raise e

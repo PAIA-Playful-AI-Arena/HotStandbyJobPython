@@ -101,7 +101,7 @@ spec:
                   properties:
                     mode:
                       type: string
-                      enum: ["annotation","http","exec"]
+                      enum: ["annotation","http","exec","redis"]
                       default: "annotation"
                     annotationKey:
                       type: string
